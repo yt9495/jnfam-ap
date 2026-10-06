@@ -1163,7 +1163,7 @@ function invoiceModal(inv, preset = {}) {
     <div class="f full"><label>${t('memo')}</label><input class="inp" id="iMemo" value="${esc(inv.memo)}"></div>
     <div class="f"><label>${t('account')}</label><select class="inp" id="iAcc">${accountOptions(inv.accountCode)}</select><span class="hint" id="iAccHint"></span></div>
     <div class="f"><label>${t('note')}</label><input class="inp" id="iNote" value="${esc(inv.note || '')}"></div>
-    <div class="f full"><label>${t('attachment')}${CLOUD ? ' · SharePoint' : ''}</label><div id="iFile">${invAttachment(inv) ? `<button class="btn sm" data-act="viewFile" data-id="${inv.id}">📎 ${CLOUD ? t('openSP') : t('view')}</button> <span class="muted" style="font-size:12px">${esc(invAttachment(inv).path ? invAttachment(inv).path + '/' + invAttachment(inv).name : invAttachment(inv).name || '')}</span> <label class="chk ed"><input type="checkbox" id="iRmFile"> ${t('removeFile')}</label>` : `<input type="file" id="iUp" class="ed" accept=".pdf,image/*">${CLOUD ? `<span class="hint">${t('spDesc')}</span>` : ''}`}</div></div>
+    ${invAttachment(inv) ? `<div class="f full"><label>${t('attachment')}</label><div id="iFile"><button class="btn sm" data-act="viewFile" data-id="${inv.id}">📎 ${CLOUD ? t('openSP') : t('view')}</button> <span class="muted" style="font-size:12px">${esc(invAttachment(inv).path ? invAttachment(inv).path + '/' + invAttachment(inv).name : invAttachment(inv).name || '')}</span> <label class="chk ed"><input type="checkbox" id="iRmFile"> ${t('removeFile')}</label></div></div>` : ''}
     ${inv.needsReview ? `<div class="f full"><div class="warnbox">${(inv.reviewFlags || []).map(k => '• ' + t('rv_' + k, { y: (inv.invoiceDate || '').slice(0, 4) })).join('<br>')}<br><label class="chk" style="margin-top:6px;color:var(--warn)"><input type="checkbox" id="iRev" checked> ${t('clearReview')}</label></div></div>` : ''}
     <div class="f full" id="iDupBox"></div>
   </div>
@@ -1183,14 +1183,6 @@ function invoiceModal(inv, preset = {}) {
     if (!doc.vendorId || !doc.invoiceDate || !$('#iAmt').value) return toast(t('required'), true);
     if ($('#iRev') && $('#iRev').checked) { doc.needsReview = false; doc.reviewFlags = []; }
     if (isNew) doc.seq = Date.now();
-    const up = $('#iUp');
-    if (up && up.files[0]) {
-      if (CLOUD) await graphToken();
-      const v = vendorById(doc.vendorId);
-      const att = await Attach.save(up.files[0], { start: v && v.spFolder, fields: doc }); if (!att) return;
-      doc.attachment = att; doc.fileName = up.files[0].name;
-      if (att.folder && v) await Store.put('vendors', { ...v, spFolder: att.folder });
-    }
     if ($('#iRmFile') && $('#iRmFile').checked) { const a0 = invAttachment(doc); if (a0 && a0.kind === 'local') await LocalStore.delFile(a0.id); doc.attachment = null; doc.attachmentId = ''; }
     await Store.put('invoices', doc); closeModal(); toast(t('savedT')); render();
   };
@@ -1797,7 +1789,6 @@ function regForm(it) {
     <div class="f full"><label>${conf(cf.memo)} ${t('memo')}</label><input class="inp rf" data-k="memo" value="${esc(f.memo || '')}"></div>
     <div class="f"><label>${t('account')}</label><select class="inp rf" data-k="accountCode">${accountOptions(f.accountCode)}</select>${v && v.accountCode && !f.accountCode ? `<span class="hint">${LANG === 'ko' ? '업체 기본' : 'Vendor default'}: ${esc(accLabel(v.accountCode))}</span>` : ''}</div>
     <div class="f"><label>${t('note')}</label><input class="inp rf" data-k="note" value="${esc(f.note || '')}"></div>
-    ${CLOUD ? `<div class="f full"><label>${t('fileName')} · SharePoint</label><input class="inp rf" data-k="fileName" value="${esc(f.fileName || defaultFileName(f, it.file))}"><span class="hint">${t('saveTo')}: ${v && v.spFolder ? `${t('vendorLast')} — ${esc(locLabel(v.spFolder))}` : '—'} · ${t('spDesc')}</span></div>` : ''}
   </div>
   ${f.currency && f.currency !== 'USD' ? `<div class="warnbox" style="margin-top:10px">${t('currency')}: ${esc(f.currency)}</div>` : ''}
   <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
@@ -1869,19 +1860,13 @@ ACT.regNewVendor = (el, e) => {
 };
 ACT.regSave = async el => {
   const it = regItem(REG.sel); if (!it) return; const f = it.fields;
-  if (CLOUD && f.vendorId && f.invoiceDate && f.amount !== '') { try { await graphToken(); } catch (e) { return toast(e.message, true); } }
   if (!f.vendorId || !f.invoiceDate || f.amount === '' || f.amount == null) return toast(t('required'), true);
   const dups = findDuplicates(f, null);
   if (dups.length && !confirm(t('dup', { x: dups.map(i => i.invoiceNo).join(', ') }) + '\n\n' + (LANG === 'ko' ? '그래도 저장할까요?' : 'Save anyway?'))) return;
-  const v = vendorById(f.vendorId);
   el.disabled = true;
   try {
-    const att = await Attach.save(it.file, { start: v && v.spFolder, fields: f, name: f.fileName ? safeName(f.fileName) : '' });
-    if (!att) { el.disabled = false; return; }
-    if (CLOUD) toast(t('savedT') + ' · SharePoint');
-    const doc = { vendorId: f.vendorId, invoiceNo: (f.invoiceNo || '').trim(), invoiceDate: f.invoiceDate, dueDate: f.dueDate || '', amount: r2(f.amount), memo: (f.memo || '').trim(), note: (f.note || '').trim(), accountCode: f.accountCode || '', attachment: att, fileName: it.file.name, source: 'upload', parsedBy: it.method, needsReview: false, reviewFlags: [], seq: Date.now() };
+    const doc = { vendorId: f.vendorId, invoiceNo: (f.invoiceNo || '').trim(), invoiceDate: f.invoiceDate, dueDate: f.dueDate || '', amount: r2(f.amount), memo: (f.memo || '').trim(), note: (f.note || '').trim(), accountCode: f.accountCode || '', attachment: null, fileName: it.file.name, source: 'upload', parsedBy: it.method, needsReview: false, reviewFlags: [], seq: Date.now() };
     var saved = await Store.put('invoices', doc);
-    if (att.folder && v) await Store.put('vendors', { ...v, spFolder: att.folder });
   } catch (e) { el.disabled = false; it.error = e.message; render(); return; }
   it.status = 'saved'; it.savedId = saved.id; it.error = '';
   toast(t('savedT')); nextReg(); render();
