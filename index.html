@@ -363,7 +363,7 @@ const Pref = {
 /* ---------- data store (IndexedDB adapter) ----------
    Interface used by the app (keep identical for the Firebase adapter):
      init() -> loads all collections into S
-     put(col, doc) / putMany(col, docs) / del(col, id) / clear()
+     put(col, doc) / putMany(col, docs) / del(col, id) / delMany(col, ids) / clear()
      putFile(id, blob, meta) / getFile(id) / delFile(id)
    Collections: vendors, invoices, payments, accounts, meta            */
 const COLS = ['vendors', 'invoices', 'payments', 'accounts', 'meta'];
@@ -393,6 +393,11 @@ const LocalStore = {
     const map = new Map(S[col].map(x => [x.id, x])); docs.forEach(d => map.set(d.id, d)); S[col] = [...map.values()];
   },
   async del(col, id) { await this.req(this.tx(col, 'readwrite').delete(id)); S[col] = S[col].filter(x => x.id !== id); },
+  async delMany(col, ids) {
+    if (!ids.length) return; const set = new Set(ids);
+    await new Promise((res, rej) => { const tx = this.db.transaction(col, 'readwrite'); const st = tx.objectStore(col); ids.forEach(id => st.delete(id)); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+    S[col] = S[col].filter(x => !set.has(x.id));
+  },
   async clear(withFiles = true) { for (const c of [...COLS, ...(withFiles ? ['files'] : [])]) { await this.req(this.tx(c, 'readwrite').clear()); if (S[c]) S[c] = []; } },
   async putFile(id, blob, meta = {}) { await this.req(this.tx('files', 'readwrite').put({ id, blob, ...meta })); return id; },
   async getFile(id) { return id ? this.req(this.tx('files').get(id)) : null; },
@@ -500,6 +505,7 @@ Object.assign(L, {
   rv_dateFromPrev: ['Invoice date not readable — used previous row date', '일자 인식 불가 — 앞 행 일자로 대체'],
   rv_dateFixedYear: ['Reference date had an invalid year — assumed {y}', '참조 일자의 연도 오류 — {y}년으로 가정'],
   rv_dateMDY: ['Reference date read as MMDDYY', '참조 일자를 MMDDYY로 해석'],
+  rv_dateFromRef: ['Invoice date taken from the document number (YYYYMMDD)', '문서번호(YYYYMMDD)에서 일자 추정'],
   rv_noInvoiceNo: ['No invoice number', '인보이스 번호 없음'],
   rv_noDate: ['No invoice date', '인보이스 일자 없음'],
   rv_parsed: ['Registered from parsed file — verify', '파일 인식으로 등록 — 확인 필요'],
@@ -546,9 +552,11 @@ function parseRef(raw, year) {
   out.no = s; return out;
 }
 
-async function importWorkbook(file) {
+const fileYear = name => +((String(name || '').match(/20\d\d/) || [])[0] || new Date().getFullYear());
+const baseSheet = s => String(s || '').replace(/[\s_-]+(20)?2\d$/, '').trim() || String(s || '').trim();   // "JNF 24" -> "JNF"
+async function importWorkbook(file, opt = {}) {
   const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellFormula: true, cellNF: true });
-  const year = +((file.name.match(/20\d\d/) || [])[0] || new Date().getFullYear());
+  const year = +opt.year || fileYear(file.name);
   const val = (ws, a) => {
     const c = ws[a]; if (!c || c.t === 'e' || c.t === 'z') return null;
     if (c.t === 'n' && c.z && XLSX.SSF.is_date(c.z)) { const p = XLSX.SSF.parse_date_code(c.v); return { date: `${p.y}-${pad(p.m)}-${pad(p.d)}` }; }
@@ -573,10 +581,11 @@ async function importWorkbook(file) {
   }
 
   /* --- AP total (vendor master) --- */
-  const apName = wb.SheetNames.find(n => /ap\s*total/i.test(n)) || wb.SheetNames[0];
-  const apWs = wb.Sheets[apName];
+  // workbooks without an "AP total" sheet (e.g. 2025_AP.xlsx with vendor sheets only) are read sheet-by-sheet
+  const apName = wb.SheetNames.find(n => /ap\s*total/i.test(n)) || null;
+  const apWs = apName ? wb.Sheets[apName] : null;
   const vendorRows = [];
-  for (let r = 2; r <= lastRow(apWs); r++) {
+  if (apWs) for (let r = 2; r <= lastRow(apWs); r++) {
     if (/total/i.test(str(val(apWs, 'A' + r)))) break;
     const name = str(val(apWs, 'B' + r)); if (!name) continue;
     const f = (apWs['C' + r] && apWs['C' + r].f) || '';
@@ -599,7 +608,7 @@ async function importWorkbook(file) {
   vendorRows.forEach(v => { if (v.sheet && !v.own && !taken.has(v.sheet)) { taken.add(v.sheet); v.own = true; } });
   vendorRows.forEach(v => { if (!v.own) v.sheet = ''; });
   const dataSheets = wb.SheetNames.filter(n => n !== apName && wb.Sheets[n] !== accWs && sheetTotalRow[n]);
-  for (const n of dataSheets) if (!taken.has(n)) vendorRows.push({ name: n, sheet: n, accountCode: '', accountNote: '', terms: null, notes: '' });
+  for (const n of dataSheets) if (!taken.has(n)) vendorRows.push({ name: baseSheet(n), sheet: n, accountCode: '', accountNote: '', terms: null, notes: '' });
 
   const defTerms = shared('defTerms', 30);
   const vendors = vendorRows.map((r, i) => {
@@ -620,8 +629,8 @@ async function importWorkbook(file) {
   for (const v of vendors) {
     if (!v.sheet) continue;
     const ws = wb.Sheets[v.sheet]; const tr = sheetTotalRow[v.sheet];
-    const excelBal = num(val(ws, 'F' + tr)) ?? 0;
-    const sideTable = /^jnf$/i.test(v.sheet);
+    const excelBal = num(val(ws, 'F' + tr)) ?? num(val(ws, 'F' + (tr + 1))) ?? 0;   // balance on the TOTAL row or the row below
+    const sideTable = /^jnf$/i.test(baseSheet(v.sheet));
     const noteCols = sideTable ? ['G', 'H', 'I'] : ['G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'];
     let feeSheet = false;
     for (let r = 3; r < tr; r++) for (const c of noteCols) if (/fee/i.test(str(val(ws, c + r)))) feeSheet = true;
@@ -636,6 +645,7 @@ async function importWorkbook(file) {
       if (C != null && C !== 0) {
         const pr = parseRef(B, year); const flags = [...pr.flags];
         let date = pr.date;
+        if (!date) { const g = String(B ?? '').match(/20(\d{2})(\d{2})(\d{2})/); if (g && Math.abs(2000 + +g[1] - year) <= 1 && validYMD(2000 + +g[1], +g[2], +g[3])) { date = `20${g[1]}-${g[2]}-${g[3]}`; flags.push('dateFromRef'); } }   // CI_JNF2025091602 -> 2025-09-16
         if (!date) { const mm = MONTHS.findIndex(m => new RegExp('\\b' + m, 'i').test(memo)); if (mm >= 0) { date = `${year}-${pad(mm + 1)}-01`; flags.push('dateFromMemo'); } }
         if (!date && payDate) { date = payDate; flags.push('dateFromPayment'); }
         if (!date && prevDate) { date = prevDate; flags.push('dateFromPrev'); }
@@ -676,10 +686,168 @@ async function runImport(file) {
   await Store.putMany('invoices', res.invoices.map(v => Store.stamp(v)));
   await Store.putMany('payments', res.payments.map(v => Store.stamp(v)));
   await setShared('importInfo', { file: file.name, at: new Date().toISOString(), by: currentUserName() });
+  await setShared('importLog', [{ id: 'imp_' + uid(), mode: 'replace', file: file.name, year: res.year, at: new Date().toISOString(), by: currentUserName(), v: res.vendors.length, i: res.invoices.length, p: res.payments.length }]);
   // reconcile
   const c = compute({ asOf: '2999-12-31', inclIC: true });
   res.report.forEach(r => { const b = c.byV.get(r.vendorId); r.appBal = b ? b.balance : 0; r.diff = r2(r.appBal - r.excelBal); r.fees = r2(S.payments.filter(p => p.vendorId === r.vendorId).reduce((s, p) => s + (+p.fee || 0), 0)); });
   return res;
+}
+
+/* =====================================================================
+   Merge import — add another year's AP workbook (e.g. 2025_AP.xlsx)
+   without touching existing data. Vendor sheets are matched to existing
+   vendors, duplicates (carried-over invoices / same payment) are skipped,
+   every added record is tagged with importId so the import can be undone.
+   ===================================================================== */
+Object.assign(L, {
+  importSec: ['Import AP Excel', 'AP 엑셀 가져오기'],
+  importDesc2: ['Reads the AP total sheet (vendors, account codes, terms), every vendor sheet (invoices & payments) and Sheet1 (chart of accounts). Files with vendor sheets only (e.g. 2025_AP.xlsx) also work.', 'AP total 시트(업체·계정코드·결제조건), 업체별 시트(인보이스·지급), Sheet1(계정과목)을 읽습니다. 업체 시트만 있는 파일(예: 2025_AP.xlsx)도 가져올 수 있습니다.'],
+  importMerge: ['Add to existing data', '기존 데이터에 추가'], importReplace: ['Replace all data', '전체 교체'],
+  importMergeHint: ['Keeps current data and adds only new invoices and payments. Duplicates are skipped and the import can be undone.', '현재 데이터는 그대로 두고 새 인보이스·지급만 추가합니다. 중복은 건너뛰고, 나중에 되돌릴 수 있습니다.'],
+  importReplaceHint: ['Deletes everything and loads only this file.', '모든 데이터를 지우고 이 파일 내용만 남깁니다.'],
+  replaceQ: ['ALL current data (vendors, invoices, payments, settings) will be deleted and replaced with this file only.\n\nTo keep existing data, cancel and use "Add to existing data".\n\nContinue?', '현재 데이터(업체·인보이스·지급·설정)가 모두 삭제되고 이 파일 내용만 남습니다.\n\n기존 데이터를 유지하려면 취소 후 "기존 데이터에 추가"를 사용하세요.\n\n계속할까요?'],
+  mergeTitle: ['Add to existing data — preview', '기존 데이터에 추가 — 미리보기'], mergeBaseYear: ['Base year (for 6-digit dates)', '기준 연도 (6자리 일자 해석용)'],
+  mergeSheet: ['Sheet', '시트'], mergeTarget: ['Add to vendor', '연결할 업체'], mergeNewV: ['＋ New vendor: {n}', '＋ 새 업체로 추가: {n}'],
+  mergeNewInv: ['New invoices', '추가 인보이스'], mergeNewPay: ['New payments', '추가 지급'], mergeDup: ['Duplicates skipped', '중복 건너뜀'],
+  mergeDupList: ['{n} invoices already exist and will be skipped — tick to add anyway', '이미 있는 인보이스 {n}건은 건너뜁니다 — 그래도 추가하려면 체크'],
+  mergeFileRow: ['In this file', '이 파일'], mergeExisting: ['Already in app', '프로그램에 있는 건'],
+  mergeNote: ['Existing data is not changed. Only the rows counted above are added. You can undo this import from Settings > Import history.', '기존 데이터는 변경되지 않고 위에 집계된 건만 추가됩니다. 설정 > 가져오기 기록에서 이번 가져오기를 되돌릴 수 있습니다.'],
+  mergeRun: ['Add {i} invoices · {p} payments', '인보이스 {i}건 · 지급 {p}건 추가'], mergeNothing: ['Nothing new to add — everything in this file is already in the app.', '추가할 새 내용이 없습니다 — 파일 내용이 이미 모두 프로그램에 있습니다.'],
+  mergeDone: ['Added {i} invoices · {p} payments · {v} vendors', '인보이스 {i}건 · 지급 {p}건 · 업체 {v}개 추가됨'],
+  importLog: ['Import history', '가져오기 기록'], undoImport: ['Undo', '되돌리기'], undone: ['Undone', '되돌림'],
+  undoQ: ['Remove the {i} invoices and {p} payments added by this import?', '이 가져오기로 추가된 인보이스 {i}건, 지급 {p}건을 삭제할까요?'],
+  undoDone: ['Import undone', '가져오기를 되돌렸습니다'], modeMerge: ['added', '추가'], modeReplace: ['replaced', '전체 교체'],
+  sheetBal: ['Sheet balance (Excel)', '시트 잔액(엑셀)'],
+});
+
+function autoMatchVendor(pv) {
+  const keys = new Set([pv.name, pv.sheet, baseSheet(pv.sheet), baseSheet(pv.name)].map(normKey).filter(Boolean));
+  const hit = arr => arr.map(normKey).some(k => k && keys.has(k));
+  return (S.vendors.find(v => hit([v.sheet || '', baseSheet(v.sheet)]))
+    || S.vendors.find(v => hit([v.name]))
+    || S.vendors.find(v => hit(v.aliases || [])) || {}).id || '';
+}
+function sameInvoice(a, b) {
+  if (Math.abs((+a.amount || 0) - (+b.amount || 0)) > 0.01) return false;
+  const k1 = normKey(a.invoiceNo), k2 = normKey(b.invoiceNo);
+  if (k1 && k2) { if (k1 === k2) return true; if (Math.min(k1.length, k2.length) >= 6 && (k1.includes(k2) || k2.includes(k1))) return true; }
+  const r1 = normKey(a.srcRef), r2_ = normKey(b.srcRef); if (r1 && r1 === r2_) return true;
+  return !k1 && !!a.invoiceDate && a.invoiceDate === b.invoiceDate;
+}
+function mergePlan(ctx) {
+  const sheets = [];
+  for (const pv of ctx.res.vendors) {
+    if (!pv.sheet) continue;
+    const target = ctx.map[pv.sheet] ?? '';
+    const pool = target ? S.invoices.filter(i => i.vendorId === target) : [];
+    const payPool = target ? S.payments.filter(p => p.vendorId === target) : [];
+    const invRows = ctx.res.invoices.filter(i => i.vendorId === pv.id).map(pi => { const dupOf = pool.find(e => sameInvoice(pi, e)) || null; return { pi, dupOf, add: !dupOf || ctx.force.has(pi.id) }; });
+    const payRows = ctx.res.payments.filter(p => p.vendorId === pv.id).map(pp => {
+      const a = (pp.allocations || [])[0]; const ir = a && invRows.find(r => r.pi.id === a.invoiceId);
+      if (ir && ir.add) return { pp, add: true, linkTo: null };
+      const dupOf = payPool.find(e => Math.abs((+e.amount || 0) - (+pp.amount || 0)) <= 0.01 && (e.date || '') === (pp.date || ''));
+      if (dupOf) return { pp, add: false, dupOf };
+      return { pp, add: true, linkTo: ir ? ir.dupOf.id : '' };
+    });
+    const rep = ctx.res.report.find(r => r.vendorId === pv.id) || {};
+    sheets.push({ pv, target, invRows, payRows, excelBal: rep.excelBal || 0 });
+  }
+  const nInv = sheets.reduce((s, x) => s + x.invRows.filter(r => r.add).length, 0);
+  const nPay = sheets.reduce((s, x) => s + x.payRows.filter(r => r.add).length, 0);
+  const nDup = sheets.reduce((s, x) => s + x.invRows.filter(r => !r.add).length + x.payRows.filter(r => !r.add).length, 0);
+  return { sheets, nInv, nPay, nDup };
+}
+
+async function startMergeImport(file) {
+  const year = fileYear(file.name);
+  const res = await importWorkbook(file, { year });
+  const ctx = { file, res, year, map: {}, force: new Set(), showDup: false };
+  res.vendors.forEach(pv => { if (pv.sheet) ctx.map[pv.sheet] = autoMatchVendor(pv); });
+  const bg = openModal({ title: t('mergeTitle'), body: '', foot: '', wide: true });
+  const draw = () => {
+    const plan = mergePlan(ctx);
+    const vOpts = (pv, sel) => `<option value="" ${!sel ? 'selected' : ''}>${esc(t('mergeNewV', { n: pv.name }))}</option>` + [...S.vendors].sort((a, b) => a.name.localeCompare(b.name)).map(v => `<option value="${v.id}" ${v.id === sel ? 'selected' : ''}>${esc(v.name)}</option>`).join('');
+    const dups = plan.sheets.flatMap(s => s.invRows.filter(r => r.dupOf).map(r => ({ s, r })));
+    const review = plan.sheets.reduce((n, s) => n + s.invRows.filter(r => r.add && r.pi.needsReview).length, 0);
+    bg.querySelector('.modal-b').innerHTML = `
+      <div class="form" style="margin-bottom:12px"><div class="f"><label>${t('fileName')}</label><input class="inp" disabled value="${esc(file.name)}"></div>
+      <div class="f"><label>${t('mergeBaseYear')}</label><input class="inp" id="mgYear" type="number" min="2015" max="2099" value="${ctx.year}"></div></div>
+      <div class="tbl-wrap" style="max-height:340px"><table class="t"><thead><tr><th>${t('mergeSheet')}</th><th>${t('mergeTarget')}</th><th class="num">${t('mergeNewInv')}</th><th class="num">${t('mergeNewPay')}</th><th class="num">${t('mergeDup')}</th><th class="num">${t('sheetBal')}</th></tr></thead><tbody>
+      ${plan.sheets.map(s => `<tr><td><b>${esc(s.pv.sheet)}</b></td><td><select class="inp mgMap" data-sheet="${esc(s.pv.sheet)}" style="min-width:200px">${vOpts(s.pv, s.target)}</select></td>
+        <td class="num">${s.invRows.filter(r => r.add).length}</td><td class="num">${s.payRows.filter(r => r.add).length}</td>
+        <td class="num ${s.invRows.some(r => !r.add) || s.payRows.some(r => !r.add) ? '' : 'muted'}">${s.invRows.filter(r => !r.add).length + s.payRows.filter(r => !r.add).length}</td><td class="num">${money(s.excelBal)}</td></tr>`).join('') || `<tr><td colspan="6" class="empty">${t('noData')}</td></tr>`}
+      </tbody></table></div>
+      ${dups.length ? `<details id="mgDup" ${ctx.showDup ? 'open' : ''} style="margin-top:12px"><summary style="cursor:pointer;font-size:13px">${t('mergeDupList', { n: dups.length })}</summary>
+        <div class="tbl-wrap" style="max-height:260px;margin-top:8px"><table class="t"><thead><tr><th></th><th>${t('mergeSheet')}</th><th>${t('mergeFileRow')}</th><th>${t('mergeExisting')}</th><th class="num">${t('amount')}</th></tr></thead><tbody>
+        ${dups.map(({ s, r }) => `<tr><td><input type="checkbox" class="mgForce" value="${r.pi.id}" ${ctx.force.has(r.pi.id) ? 'checked' : ''}></td><td>${esc(s.pv.sheet)}</td><td class="wrap">${esc(r.pi.invoiceNo)} <span class="muted">${r.pi.invoiceDate || ''}</span></td><td class="wrap">${esc(r.dupOf.invoiceNo)} <span class="muted">${r.dupOf.invoiceDate || ''}</span></td><td class="num">${money(r.pi.amount)}</td></tr>`).join('')}
+        </tbody></table></div></details>` : ''}
+      ${review ? `<p style="font-size:12px;color:var(--text-2);margin:10px 0 0">${t('needReview')}: <b>${review}</b> — ${LANG === 'ko' ? '참조번호에서 인보이스 일자를 바로 읽지 못해 추정한 건입니다. 추가 후 인보이스 목록에서 확인하세요.' : 'invoice date was inferred; check them in Invoices after adding.'}</p>` : ''}
+      <div class="${plan.nInv + plan.nPay ? 'okbox' : 'muted'}" style="margin-top:12px;font-size:13px">${plan.nInv + plan.nPay ? t('mergeNote') : t('mergeNothing')}</div>`;
+    bg.querySelector('.modal-f').innerHTML = `<span class="sp"></span><button class="btn" data-act="closeModal">${t('cancel')}</button><button class="btn pri" id="mgRun" ${plan.nInv + plan.nPay ? '' : 'disabled'}>${t('mergeRun', { i: plan.nInv, p: plan.nPay })}</button>`;
+    $$('.mgMap', bg).forEach(el => el.onchange = () => { ctx.map[el.dataset.sheet] = el.value; draw(); });
+    $$('.mgForce', bg).forEach(el => el.onchange = () => { if (el.checked) ctx.force.add(el.value); else ctx.force.delete(el.value); ctx.showDup = true; draw(); });
+    const dEl = $('#mgDup', bg); if (dEl) dEl.ontoggle = () => { ctx.showDup = dEl.open; };
+    $('#mgYear', bg).onchange = async e => {
+      const y = +e.target.value; if (!(y >= 2000 && y < 2100)) return;
+      try { ctx.year = y; ctx.res = await importWorkbook(file, { year: y }); const old = ctx.map; ctx.map = {}; ctx.force = new Set(); ctx.res.vendors.forEach(pv => { if (pv.sheet) ctx.map[pv.sheet] = pv.sheet in old ? old[pv.sheet] : autoMatchVendor(pv); }); draw(); } catch (err) { toast(err.message, true); }
+    };
+    $('#mgRun', bg).onclick = async () => {
+      const btn = $('#mgRun', bg); btn.disabled = true; btn.textContent = t('saving');
+      try { const out = await runMerge(ctx, mergePlan(ctx)); closeModal(bg); render(); toast(t('mergeDone', out)); }
+      catch (err) { console.error(err); toast(err.message, true); btn.disabled = false; draw(); }
+    };
+  };
+  if (!bg.querySelector('.modal-f')) bg.querySelector('.modal').insertAdjacentHTML('beforeend', '<div class="modal-f"></div>');
+  draw();
+}
+
+async function runMerge(ctx, plan) {
+  const importId = 'imp_' + uid();
+  const newV = [], newI = [], newP = [];
+  let order = S.vendors.reduce((m, v) => Math.max(m, v.order ?? 0), 0);
+  let seq = S.invoices.reduce((m, i) => Math.max(m, i.seq ?? 0), 0);
+  // open amounts of existing invoices (to cap allocations of new payments)
+  const applied = new Map(); for (const p of S.payments) for (const a of p.allocations || []) applied.set(a.invoiceId, r2((applied.get(a.invoiceId) || 0) + (+a.amount || 0)));
+  const openOf = id => { const i = S.invoices.find(x => x.id === id); return i ? r2((+i.amount || 0) - (applied.get(id) || 0)) : 0; };
+  for (const s of plan.sheets) {
+    if (!s.invRows.some(r => r.add) && !s.payRows.some(r => r.add)) continue;
+    let vid = s.target;
+    if (!vid) { const v = { ...s.pv, id: 'v_' + uid(), order: ++order, importId }; newV.push(Store.stamp(v)); vid = v.id; }
+    const idMap = new Map();
+    for (const r of s.invRows) { if (!r.add) continue; const d = { ...r.pi, id: 'i_' + uid(), vendorId: vid, seq: ++seq, importId, source: 'excel' }; idMap.set(r.pi.id, d.id); newI.push(Store.stamp(d)); }
+    for (const r of s.payRows) {
+      if (!r.add) continue;
+      const p = { ...r.pp, id: 'p_' + uid(), vendorId: vid, importId, source: 'excel', allocations: [] };
+      if (r.linkTo === null) p.allocations = (r.pp.allocations || []).map(a => ({ invoiceId: idMap.get(a.invoiceId), amount: a.amount })).filter(a => a.invoiceId);
+      else if (r.linkTo) { const amt = r2(Math.min((+p.amount || 0) - (+p.fee || 0), Math.max(0, openOf(r.linkTo)))); if (amt > 0) { p.allocations = [{ invoiceId: r.linkTo, amount: amt }]; applied.set(r.linkTo, r2((applied.get(r.linkTo) || 0) + amt)); } }
+      newP.push(Store.stamp(p));
+    }
+  }
+  const newAcc = ctx.res.accounts.filter(a => !S.accounts.some(x => String(x.code) === String(a.code)));
+  if (newAcc.length) await Store.putMany('accounts', newAcc);
+  if (newV.length) await Store.putMany('vendors', newV);
+  if (newI.length) await Store.putMany('invoices', newI);
+  if (newP.length) await Store.putMany('payments', newP);
+  const log = shared('importLog', []);
+  await setShared('importLog', [{ id: importId, mode: 'merge', file: ctx.file.name, year: ctx.year, at: new Date().toISOString(), by: currentUserName(), v: newV.length, i: newI.length, p: newP.length }, ...log].slice(0, 30));
+  return { v: newV.length, i: newI.length, p: newP.length };
+}
+
+async function undoImport(el) {
+  const id = el.dataset.id;
+  const invIds = S.invoices.filter(i => i.importId === id).map(i => i.id), payIds = S.payments.filter(p => p.importId === id).map(p => p.id);
+  if (!confirm(t('undoQ', { i: invIds.length, p: payIds.length }))) return;
+  try {
+    const dI = new Set(invIds);
+    await Store.delMany('payments', payIds);
+    // detach any other payment that was later applied to a removed invoice
+    for (const p of S.payments.filter(p => (p.allocations || []).some(a => dI.has(a.invoiceId)))) await Store.put('payments', { ...p, allocations: p.allocations.filter(a => !dI.has(a.invoiceId)) });
+    await Store.delMany('invoices', invIds);
+    const vIds = S.vendors.filter(v => v.importId === id && !S.invoices.some(i => i.vendorId === v.id) && !S.payments.some(p => p.vendorId === v.id)).map(v => v.id);
+    await Store.delMany('vendors', vIds);
+    await setShared('importLog', shared('importLog', []).map(x => x.id === id ? { ...x, undone: new Date().toISOString() } : x));
+    toast(t('undoDone')); render();
+  } catch (err) { console.error(err); toast(err.message, true); }
 }
 
 /* =====================================================================
@@ -940,6 +1108,7 @@ const UI = {
   vendorTab: 'ledger',
 };
 const ACT = {};
+ACT.undoImport = undoImport;
 let CH = {};
 const AGE_COLORS = ['var(--ag0)', 'var(--ag1)', 'var(--ag2)', 'var(--ag3)', 'var(--ag4)'];
 
@@ -1370,9 +1539,19 @@ function vSettings() {
     <div class="f" style="justify-content:flex-end"><button class="btn pri" id="sSaveShared">${t('save')}</button></div></div>`, 'adm');
   h += `</div><div>`;
   h += sec(t('dataSec'), `
-    <div class="adm"><p><b>${t('importXlsx')}</b><br>${t('importDesc')}</p>
-    ${info ? `<div class="okbox">${esc(info.file)} · ${info.at.slice(0, 16).replace('T', ' ')}${info.by ? ' · ' + esc(info.by) : ''}</div>` : ''}
-    <input type="file" id="sXlsx" accept=".xlsx,.xls" style="display:none"><button class="btn pri" onclick="document.getElementById('sXlsx').click()">⤒ ${t('importXlsx').split('(')[0]}</button>
+    <div class="adm"><p><b>${t('importSec')}</b><br>${t('importDesc2')}</p>
+    <input type="file" id="sXlsxM" accept=".xlsx,.xls" style="display:none"><input type="file" id="sXlsx" accept=".xlsx,.xls" style="display:none">
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;gap:10px;align-items:center"><button class="btn pri" style="white-space:nowrap" onclick="document.getElementById('sXlsxM').click()">⤒ ${t('importMerge')}</button><span class="muted" style="font-size:12px">${t('importMergeHint')}</span></div>
+      <div style="display:flex;gap:10px;align-items:center"><button class="btn" style="white-space:nowrap" onclick="document.getElementById('sXlsx').click()">⤒ ${t('importReplace')}</button><span class="muted" style="font-size:12px">${t('importReplaceHint')}</span></div>
+    </div>
+    ${(() => {
+      const log = shared('importLog', null) || (info ? [{ mode: 'replace', file: info.file, at: info.at, by: info.by }] : []);
+      if (!log.length) return '';
+      return `<div style="margin-top:14px"><div style="font-weight:600;font-size:13px;margin-bottom:6px">${t('importLog')}</div><table class="t"><tbody>${log.slice(0, 8).map(x => `<tr><td class="wrap">${esc(x.file)}<div class="muted" style="font-size:11px">${(x.at || '').slice(0, 16).replace('T', ' ')}${x.by ? ' · ' + esc(x.by) : ''}</div></td>
+        <td class="muted" style="font-size:12px;white-space:nowrap">${t(x.mode === 'merge' ? 'modeMerge' : 'modeReplace')}${x.i != null ? ` · ${LANG === 'ko' ? '인보이스' : 'inv'} ${x.i} · ${LANG === 'ko' ? '지급' : 'pay'} ${x.p}` : ''}</td>
+        <td class="right">${x.mode === 'merge' ? (x.undone ? `<span class="muted" style="font-size:12px">${t('undone')}</span>` : `<button class="btn sm" data-act="undoImport" data-id="${esc(x.id)}">${t('undoImport')}</button>`) : ''}</td></tr>`).join('')}</tbody></table></div>`;
+    })()}
     <hr style="border:0;border-top:1px solid var(--line);margin:16px 0"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><button class="btn" data-act="exportXlsx">⤓ ${t('exportXlsx')}</button><button class="btn" id="sBackup">⤓ ${t('backup')}</button>${CLOUD ? '' : `<label class="chk"><input type="checkbox" id="sInclF" checked> ${t('inclFiles')}</label>`}</div>
     <div class="adm" style="display:flex;gap:8px;margin-top:10px"><input type="file" id="sRestoreF" accept=".json" style="display:none"><button class="btn" onclick="document.getElementById('sRestoreF').click()">⤒ ${t('restore')}</button><span style="flex:1"></span><button class="btn danger" id="sReset">${t('resetAll')}</button></div>
@@ -1390,7 +1569,8 @@ function vSettings() {
     on('spSave', 'onclick', async () => { await setShared('sharepoint', { host: $('#spH').value.trim().replace(/^https?:\/\//, '').replace(/\/.*$/, ''), sitePath: '/' + $('#spS').value.trim().replace(/^\/+|\/+$/g, ''), library: $('#spL').value.trim(), folder: $('#spF').value.trim().replace(/^\/+|\/+$/g, '') }); SP.site = null; toast(t('savedT')); render(); });
     on('spTest', 'onclick', async () => { try { await graphToken(); const l = await pickFolder(null); if (l) toast(locLabel(l)); } catch (e) { toast(e.message, true); } });
     on('sSaveShared', 'onclick', async () => { await setShared('selfNames', $('#sSelf').value.split(',').map(s => s.trim()).filter(Boolean)); await setShared('defTerms', +$('#sTerms').value || 30); toast(t('savedT')); });
-    on('sXlsx', 'onchange', async e => { const f = e.target.files[0]; if (!f) return; if (S.invoices.length && !confirm(t('importDesc'))) return; try { toast(t('loading')); const res = await runImport(f); showImportReport(res); render(); } catch (err) { console.error(err); toast(err.message, true); } e.target.value = ''; });
+    on('sXlsxM', 'onchange', async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return; try { toast(t('loading')); await startMergeImport(f); } catch (err) { console.error(err); toast(err.message, true); } });
+    on('sXlsx', 'onchange', async e => { const f = e.target.files[0]; if (!f) return; if ((S.invoices.length || S.payments.length) && !confirm(t('replaceQ'))) { e.target.value = ''; return; } try { toast(t('loading')); const res = await runImport(f); showImportReport(res); render(); } catch (err) { console.error(err); toast(err.message, true); } e.target.value = ''; });
     on('sBackup', 'onclick', () => backup(!CLOUD && $('#sInclF') && $('#sInclF').checked));
     on('sRestoreF', 'onchange', async e => { const f = e.target.files[0]; if (!f) return; if (!confirm(t('restoreQ'))) return; try { await restore(f); toast(t('importDone')); render(); } catch (err) { toast(err.message, true); } e.target.value = ''; });
     on('sReset', 'onclick', async () => { if (!confirm(t('resetQ'))) return; await Store.clear(true); render(); });
@@ -1509,6 +1689,10 @@ const CloudStore = {
     const map = new Map(S[col].map(x => [x.id, x])); docs.forEach(d => map.set(d.id, this.clean(d))); S[col] = [...map.values()];
   },
   async del(col, id) { await this.db.collection(col).doc(String(id)).delete(); S[col] = S[col].filter(x => x.id !== id); },
+  async delMany(col, ids) {
+    for (let i = 0; i < ids.length; i += 400) { const b = this.db.batch(); ids.slice(i, i + 400).forEach(id => b.delete(this.db.collection(col).doc(String(id)))); await b.commit(); }
+    const set = new Set(ids); S[col] = S[col].filter(x => !set.has(x.id));
+  },
   async clear() {
     for (const c of COLS) {
       const snap = await this.db.collection(c).get();
