@@ -1,8 +1,4 @@
 <!doctype html>
-<!--
-  © 2025–2026 Young Tai Kang. All rights reserved.
-  Unauthorized use, copying, modification, or distribution without the written permission of Young Tai Kang is prohibited.
--->
 <html lang="ko">
 <head>
 <meta charset="utf-8">
@@ -1423,16 +1419,20 @@ ACT.newPay = el => paymentModal(null, { vendorId: el.dataset.vendor || UI.pay.ve
 ACT.delPay = async el => { if (!confirm(t('confirmDel'))) return; await Store.del('payments', el.dataset.id); closeModal(); toast(t('deleted')); render(); };
 
 /* =================== PAYMENTS =================== */
-function vPayments() {
-  if (!S.vendors.length) return welcome();
+function filteredPayments() {
   const f = UI.pay; const q = f.q.toLowerCase();
   const ok = id => UI.inclIC || !isIC(vendorById(id));
-  let list = S.payments.filter(p => ok(p.vendorId) && (!f.vendor || p.vendorId === f.vendor) && (!f.method || p.method === f.method) && (!f.from || (p.date || '') >= f.from) && (!f.to || (p.date || '9') <= f.to)
+  const list = S.payments.filter(p => ok(p.vendorId) && (!f.vendor || p.vendorId === f.vendor) && (!f.method || p.method === f.method) && (!f.from || (p.date || '') >= f.from) && (!f.to || (p.date || '9') <= f.to)
     && (!q || `${vName(p.vendorId)} ${p.ref} ${p.memo} ${p.amount} ${(p.allocations || []).map(a => S.invoices.find(i => i.id === a.invoiceId)?.invoiceNo).join(' ')}`.toLowerCase().includes(q)));
-  list.sort((a, b) => (b.date || '9999').localeCompare(a.date || '9999'));
+  return list.sort((a, b) => (b.date || '9999').localeCompare(a.date || '9999'));
+}
+function vPayments() {
+  if (!S.vendors.length) return welcome();
+  const f = UI.pay;
+  const list = filteredPayments();
   const tot = list.reduce((s, p) => s + (+p.amount || 0), 0);
   const shown = list.slice(0, f.limit);
-  let h = pageHead(t('payments'), t('showing', { n: shown.length, m: list.length }), `<label class="chk"><input type="checkbox" id="inclIC" ${UI.inclIC ? 'checked' : ''}> ${t('inclIC')}</label><button class="btn pri ed" data-act="newPay">＋ ${t('recordPayment')}</button>`);
+  let h = pageHead(t('payments'), t('showing', { n: shown.length, m: list.length }), `<label class="chk"><input type="checkbox" id="inclIC" ${UI.inclIC ? 'checked' : ''}> ${t('inclIC')}</label><button class="btn" data-act="exportPayXlsx">⤓ ${t('exportXlsx')}</button><button class="btn pri ed" data-act="newPay">＋ ${t('recordPayment')}</button>`);
   h += `<div class="filters"><input class="inp" id="gq" placeholder="${t('search')}" value="${esc(f.q)}" style="width:220px"><select class="inp" id="gv">${vendorOptions(f.vendor).replace(t('selVendor'), LANG === 'ko' ? '전체 업체' : 'All vendors')}</select>
   <select class="inp" id="gm"><option value="">${t('method')}: ${t('all')}</option>${METHODS.map(m => `<option value="${m}" ${f.method === m ? 'selected' : ''}>${t('methods_' + m)}</option>`).join('')}</select>
   <label class="chk">${t('from')} <input type="date" class="inp" id="gf" value="${f.from}"></label><label class="chk">${t('to')} <input type="date" class="inp" id="gt" value="${f.to}"></label>
@@ -1448,6 +1448,30 @@ function vPayments() {
   return h;
 }
 ACT.morePay = () => { UI.pay.limit += 500; render(); };
+ACT.exportPayXlsx = () => {
+  const list = filteredPayments(); const f = UI.pay;
+  if (!list.length) return toast(t('noData'), true);
+  const ko = LANG === 'ko';
+  const hdr = ko ? ['지급일', '업체', '지급방법', '참조번호', '메모', '배분 인보이스', '배분 인보이스 일자', '금액', '수수료/추가금', '배분액', '미배분 지급']
+    : ['Payment Date', 'Vendor', 'Method', 'Reference', 'Memo', 'Applied To', 'Invoice Date(s)', 'Amount', 'Fee', 'Applied', 'Unapplied'];
+  const rows = list.map(p => {
+    const invs = (p.allocations || []).map(a => S.invoices.find(i => i.id === a.invoiceId)).filter(Boolean);
+    const applied = r2((p.allocations || []).reduce((s, a) => s + (+a.amount || 0), 0));
+    return [p.date || '', vName(p.vendorId), p.method ? t('methods_' + p.method) : '', p.ref || '', p.memo || '', invs.map(i => i.invoiceNo).join(', '), invs.map(i => i.invoiceDate || '').join(', '), +p.amount || 0, +p.fee || 0, applied, payUnapplied(p)];
+  });
+  const sum = k => r2(rows.reduce((s, r) => s + r[k], 0));
+  const cond = [f.vendor ? vName(f.vendor) : (ko ? '전체 업체' : 'All vendors'), f.method ? t('methods_' + f.method) : '', (f.from || f.to) ? `${f.from || '…'} ~ ${f.to || '…'}` : '', f.q ? `"${f.q}"` : ''].filter(Boolean).join(' · ');
+  const aoa = [[(ko ? '지급 내역' : 'Payments') + ' — ' + cond], [], hdr, ...rows, [ko ? '합계' : 'TOTAL', '', '', '', '', '', '', sum(7), sum(8), sum(9), sum(10)]];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  const last = aoa.length;
+  for (let r = 4; r <= last; r++) for (const c of ['H', 'I', 'J', 'K']) { const cell = ws[c + r]; if (cell && cell.t === 'n') cell.z = '#,##0.00;[Red]-#,##0.00'; }
+  ws['!cols'] = [{ wch: 12 }, { wch: 30 }, { wch: 12 }, { wch: 18 }, { wch: 28 }, { wch: 36 }, { wch: 22 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+  ws['!autofilter'] = { ref: `A3:K${last - 1}` };
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Payments');
+  const tag = f.vendor ? '_' + safeName(vName(f.vendor)).replace(/\s+/g, '_') : '';
+  const rng = (f.from || f.to) ? `_${(f.from || '').replace(/-/g, '')}-${(f.to || '').replace(/-/g, '')}` : '_' + todayStr();
+  XLSX.writeFile(wb, `JNFAM_AP_Payments${tag}${rng}.xlsx`);
+};
 
 /* =================== VENDORS =================== */
 function vVendors() {
@@ -2118,7 +2142,5 @@ function langPicker() {
 }
 
 </script>
-<style>.ytk-copyright{text-align:center;font-size:11px;line-height:1.4;color:#8a8f98;padding:10px 12px;font-family:inherit}@media print{.ytk-copyright{display:none}}</style>
-<div class="ytk-copyright">© 2025–2026 Young Tai Kang. All rights reserved. Unauthorized use, copying, modification, or distribution without the written permission of Young Tai Kang is prohibited.</div>
 </body>
 </html>
